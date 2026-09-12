@@ -53,14 +53,18 @@ static void cleanup(void) {
   fflush(stdout);
 }
 
-// First Ctrl-C asks the render loop to stop, so it exits through the normal
-// path and still prints the settled flat logo. A second one bails out hard,
-// in case the loop is wedged somewhere it can't reach the flag.
+// Handlers are installed before the gather_*() calls, which spend a couple of
+// seconds in popen(), so a signal there is caught rather than killing the
+// process outright. Nothing is on screen yet at that point, so it just exits.
+// Once the render loop owns the screen, the first signal only asks it to stop,
+// letting it leave through the normal path and print the settled flat logo; a
+// second one bails out hard in case the loop can't reach the flag.
+static volatile sig_atomic_t animating = 0;
 static volatile sig_atomic_t interrupted = 0;
 
 static void handle_signal(int sig) {
   (void)sig;
-  if (interrupted) {
+  if (!animating || interrupted) {
     cleanup();
     _exit(0);
   }
@@ -4294,6 +4298,13 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Installed before the slow gather_*() calls so an interrupt during startup
+  // is handled instead of killing the process.
+  signal(SIGINT, handle_signal);
+  signal(SIGTERM, handle_signal);
+  signal(SIGWINCH, handle_winch);
+  atexit(cleanup);
+
   config_defaults();
   load_config();
   get_term_size(&term_rows, &term_cols);
@@ -4428,11 +4439,6 @@ int main(int argc, char **argv) {
   const float hl0 = sqrtf(hx0 * hx0 + hy0 * hy0 + hz0 * hz0);
   const float hlx = hx0 / hl0, hly = hy0 / hl0, hlz = hz0 / hl0;
 
-  signal(SIGINT, handle_signal);
-  signal(SIGTERM, handle_signal);
-  signal(SIGWINCH, handle_winch);
-  atexit(cleanup);
-
   int fetch_start = show_info ? 1 : 0;
 
   if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
@@ -4446,6 +4452,9 @@ int main(int argc, char **argv) {
 
   printf("\033[?25l\033[?1002h\033[?1006h\033[2J");
   fflush(stdout);
+
+  // The screen is ours from here, so a signal should settle rather than exit.
+  animating = 1;
 
   int mouse_dragging = 0;
   int mouse_last_x = 0, mouse_last_y = 0;

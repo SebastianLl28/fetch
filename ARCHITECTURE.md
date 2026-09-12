@@ -88,12 +88,16 @@ sequences are read and parsed, for SGR mouse reporting (`\033[<btn;x;yM`) used b
 drag-to-rotate. Never add an unconditional `read()` to that loop.
 
 Raw mode, `\033[?25l` and mouse modes 1002/1006 are undone by `cleanup()`, wired
-through `atexit()`. `handle_signal()` only sets the `interrupted` flag that the
-render loop checks, so SIGINT leaves through the normal exit path (and prints the
-settled logo) rather than calling `cleanup()` from signal context; a second
-signal does call it and `_exit()`, as the escape hatch. Note the handlers are
-installed *after* the `gather_*()` calls, so a signal during the couple of
-seconds those `popen()`s take still kills the process outright.
+through `atexit()`. Handlers go in right after argv parsing, before the
+`gather_*()` calls — those spend a couple of seconds in `popen()`, and a signal
+there would otherwise kill the process outright.
+
+`handle_signal()` branches on the `animating` flag, set once the render loop owns
+the screen. Before that nothing has been drawn, so it just cleans up and exits.
+During the animation the first signal only raises `interrupted`, which the loop
+checks, so SIGINT leaves through the normal path and prints the settled logo
+instead of calling the non-async-signal-safe `cleanup()` from signal context; a
+second signal does call it and `_exit()`, as the escape hatch.
 
 ### Exiting — the flat logo
 
