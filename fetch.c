@@ -53,10 +53,18 @@ static void cleanup(void) {
   fflush(stdout);
 }
 
+// First Ctrl-C asks the render loop to stop, so it exits through the normal
+// path and still prints the settled flat logo. A second one bails out hard,
+// in case the loop is wedged somewhere it can't reach the flag.
+static volatile sig_atomic_t interrupted = 0;
+
 static void handle_signal(int sig) {
   (void)sig;
-  cleanup();
-  _exit(0);
+  if (interrupted) {
+    cleanup();
+    _exit(0);
+  }
+  interrupted = 1;
 }
 
 static volatile sig_atomic_t term_resized = 0;
@@ -3978,6 +3986,154 @@ static void get_alignment_padding(int* vertical, int* horizontal) {
   }
 }
 
+// Print one flat logo row, clipped to max_cols visible columns. Returns the
+// number of columns written. Colors follow the animation: per-character ANSI
+// when the logo carries its own, otherwise the flat face color (logo_inner),
+// since a flat logo has no extruded sides to paint with logo_outer.
+static int emit_logo_row(int lr, int max_cols, int use_color) {
+  int prev_color = -1;
+  int n = logo_cell_counts[lr];
+  if (max_cols >= 0 && n > max_cols)
+    n = max_cols;
+  if (use_color && !logo_has_ansi && n > 0)
+    fputs(color_inner, stdout);
+  for (int j = 0; j < n; j++) {
+    int c = logo_cell_color[lr][j];
+    if (use_color && logo_has_ansi && c != prev_color) {
+      if (c > 0)
+        printf("\033[1;%dm", c);
+      else
+        fputs("\033[0m", stdout);
+      prev_color = c;
+    }
+    fputs(logo_cells[lr][j], stdout);
+  }
+  if (use_color && n > 0 && (!logo_has_ansi || prev_color > 0))
+    fputs("\033[0m", stdout);
+  return n;
+}
+
+// Print one info line clipped to info_clip_cols, reusing the same clipper
+// the animation uses so a narrow pane truncates instead of wrapping.
+static void emit_info_line(const char *line) {
+  char tmp[MAX_LINE_LEN * 2];
+  char *e = emit_clipped(tmp, tmp + sizeof(tmp) - 8, line, info_clip_cols);
+  fwrite(tmp, 1, (size_t)(e - tmp), stdout);
+}
+
+// Personal-use exit view: instead of freezing the 3D relief, print the
+// logo flat exactly as loaded (same per-character colors fastfetch gave
+// it), centered inside the same canvas the animation spun in. Mirrors
+// apply_layout()'s three regimes — beside, shrunken, stacked — so the info
+// block keeps the exact row and column it had in the last animated frame
+// and a narrow i3 pane clips instead of wrapping.
+static void print_flat_logo(int show_info, int use_color) {
+  printf("\033[2J\033[H");
+
+  int top_padding, left_padding;
+  get_alignment_padding(&top_padding, &left_padding);
+
+  // Row budget: leave the last line for the shell prompt, like apply_layout.
+  int avail = term_rows > 1 ? term_rows - 1 : term_rows;
+  if (avail > 0 && top_padding > 0) {
+    if (top_padding >= avail)
+      top_padding = avail - 1;
+    avail -= top_padding;
+  }
+  for (int i = 0; i < top_padding; i++)
+    putchar('\n');
+
+  int logo_x = (anim_width - logo_cols) / 2;
+  if (logo_x < 0)
+    logo_x = 0;
+
+  if (layout_stacked) {
+    // Logo on top, info below. The flat logo can't be scaled down the way
+    // the 3D one is, so it is drawn whole or not at all — a half-cut ASCII
+    // logo reads as broken. Info takes whatever rows are left.
+    int show_logo = (avail <= 0) || (logo_rows + 1 < avail);
+    int used = 0;
+    if (show_logo) {
+      for (int lr = 0; lr < logo_rows; lr++) {
+        if (left_padding > 0)
+          printf("%*s", left_padding, "");
+        printf("%*s", logo_x, "");
+        emit_logo_row(lr, anim_width - logo_x, use_color);
+        putchar('\n');
+      }
+      putchar('\n');
+      used = logo_rows + 1;
+    }
+    if (show_info) {
+      int n = fetch_line_count;
+      if (avail > 0 && n > avail - used)
+        n = avail - used;
+      for (int i = 0; i < n; i++) {
+        if (left_padding > 0)
+          printf("%*s", left_padding, "");
+        emit_info_line(fetch_lines[i]);
+        putchar('\n');
+      }
+    }
+    fflush(stdout);
+    return;
+  }
+
+  int fetch_start = show_info ? 1 : 0;
+  // Same vertical center the projection uses, so the flat logo lands where
+  // the spinning one was.
+  float y_center = (fetch_line_count > 0 &&
+                    fetch_line_count + 2 <= render_height)
+                       ? fetch_start + fetch_line_count * 0.5f
+                       : render_height * 0.5f;
+  int logo_y = (int)(y_center - logo_rows * 0.5f);
+  if (logo_y < 0)
+    logo_y = 0;
+
+  int rows = logo_y + logo_rows;
+  if (rows > render_height)
+    rows = render_height;
+  if (show_info && fetch_start + fetch_line_count > rows)
+    rows = fetch_start + fetch_line_count;
+  if (avail > 0 && rows > avail)
+    rows = avail;
+
+  // Too short for the whole logo: clip it evenly top and bottom so the
+  // recognizable middle survives instead of lopping off the bottom.
+  int logo_skip = 0;
+  if (logo_rows > rows) {
+    logo_y = 0;
+    logo_skip = (logo_rows - rows) / 2;
+  } else if (logo_y + logo_rows > rows) {
+    logo_y = rows - logo_rows;
+  }
+
+  for (int i = 0; i < rows; i++) {
+    if (left_padding > 0)
+      printf("%*s", left_padding, "");
+
+    int cols_written = 0;
+    int lr = i - logo_y + logo_skip;
+    if (lr >= logo_skip && lr < logo_rows) {
+      printf("%*s", logo_x, "");
+      cols_written = logo_x + emit_logo_row(lr, anim_width - logo_x, use_color);
+    }
+
+    if (show_info) {
+      int fi = i - fetch_start;
+      if (fi >= 0 && fi < fetch_line_count) {
+        int pad = anim_width - cols_written + GAP;
+        if (pad < 1)
+          pad = 1;
+        printf("%*s", pad, "");
+        emit_info_line(fetch_lines[fi]);
+      }
+    }
+    putchar('\n');
+  }
+  fflush(stdout);
+}
+
 int main(int argc, char **argv) {
   char distro[64] = "";
   const char *logo_name = NULL;
@@ -4295,11 +4451,12 @@ int main(int argc, char **argv) {
   int mouse_last_x = 0, mouse_last_y = 0;
   float drag_vx = 0.0f, drag_vy = 0.0f;
 
-  for (int frame = 0; max_frames == 0 || frame < max_frames; frame++) {
+  for (int frame = 0;; frame++) {
     // Read input: mouse events control rotation, any other key exits.
     // Peek one byte first — only consume input if it's an escape (mouse).
     // Non-escape bytes stay in the buffer so the shell gets the keypress.
-    int should_break = 0;
+    int should_break =
+        interrupted || (max_frames != 0 && frame >= max_frames);
     struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
     while (poll(&pfd, 1, 0) > 0) {
       static char ibuf[128];
@@ -4390,7 +4547,6 @@ int main(int argc, char **argv) {
       }
       if (should_break) break;
     }
-    if (should_break) break;
     // Handle terminal resize: recompute the same layout as startup
     if (term_resized) {
       term_resized = 0;
@@ -4427,6 +4583,10 @@ int main(int argc, char **argv) {
       is_refresh_pass = 0;
     }
 
+    if (should_break) {
+      print_flat_logo(show_info, use_color);
+      break;
+    }
     clear_buf();
     if (!mouse_dragging) {
       if (drag_vx != 0.0f || drag_vy != 0.0f) {
