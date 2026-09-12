@@ -4447,7 +4447,11 @@ int main(int argc, char **argv) {
     raw.c_lflag &= ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    // TCSANOW, not TCSAFLUSH: the gather_*() calls just above can take a
+    // couple of seconds (package manager queries), and TCSAFLUSH would
+    // silently discard anything typed during that window instead of
+    // handing it to the input loop below.
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
   }
 
   printf("\033[?25l\033[?1002h\033[?1006h\033[2J");
